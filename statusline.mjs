@@ -66,15 +66,6 @@ function pctColor(pct) {
   return pct < 60 ? green : pct < 85 ? yellow : red;
 }
 
-function usageBar(ratio, width = 10) {
-  const r = Math.max(0, Math.min(1, ratio));
-  const filled = Math.round(r * width);
-  const bar = '█'.repeat(filled) + '░'.repeat(width - filled);
-  const pct = `${Math.round(r * 100)}%`;
-  const color = r < 0.6 ? green : r < 0.85 ? yellow : red;
-  return color(`${bar} ${pct}`);
-}
-
 // Approximate system RAM usage. macOS: total - (free + inactive + speculative).
 function memorySegment() {
   try {
@@ -90,7 +81,8 @@ function memorySegment() {
     }
     const used = Math.max(0, total - avail);
     const g = (b) => Math.round(b / 1073741824);
-    return `${dim('内存')} ${usageBar(used / total)} ${dim(`(${g(used)}G/${g(total)}G)`)}`;
+    const pct = Math.round((used / total) * 100);
+    return `${dim('内存')} ${pctColor(pct)(`${pct}%`)} ${dim(`(${g(used)}G/${g(total)}G)`)}`;
   } catch {
     return null;
   }
@@ -202,7 +194,7 @@ function sessionUsageSegment(sessionDir) {
       }
     }
     if (input === 0 && output === 0) return null;
-    return `${dim('会话')} in ${fmtTokens(input)} out ${fmtTokens(output)}`;
+    return `${dim('会话')} in ${cyan(fmtTokens(input))} out ${magenta(fmtTokens(output))}`;
   } catch {
     return null;
   }

@@ -5,7 +5,7 @@
 ## 效果
 
 ```
-~/Documents/Codex ⎇ main +2 ~1 | yolo | [K3 ● max] | 内存 █████░░░░░ 47% (30G/64G) | 会话 in 9.2M out 68.0k | 周 24% (1d 18h) 5h 24% (1h 57m) | Kimi v0.30.0
+~/Documents/Codex ⎇ main +2 ~1 | yolo | [K3 ● max] | 内存 47% (30G/64G) | 会话 in 9.2M out 68.0k | 周 24% (1d 18h) 5h 24% (1h 57m) | Kimi v0.30.0
 ```
 
 底栏第 2 行始终是内置的 context 读数，不受影响。
@@ -17,8 +17,8 @@
 | 目录 / git | 当前目录（home 显示为 `~`，最多保留末两级）；git 仓库内追加分支名与工作区统计：`+N`（绿，新增 = 未跟踪 + 已暂存新文件）、`~N`（黄，修改/删除/重命名），为零则不显示 |
 | permission | 权限/计划模式：`manual`（暗）、`plan`（蓝）、`yolo`（黄）、`auto`（红） |
 | 模型 | `[模型名 ● effort]`，如 `[K3 ● max]` |
-| 内存条 | 系统 RAM 占用进度条（绿 <60%、黄 <85%、红 ≥85%），macOS 用 `vm_stat` 估算（total − free − inactive − speculative），其他平台退化为 `os.freemem` 近似 |
-| 会话用量 | 本会话累计 token：`in` = 输入（含缓存读取），`out` = 输出，口径与 `/usage` 的 Session usage 一致 |
+| 内存 | 系统 RAM 占用：`内存 47% (30G/64G)`，百分比按阈值着色（绿 <60%、黄 <85%、红 ≥85%）；macOS 用 `vm_stat` 估算（total − free − inactive − speculative），其他平台退化为 `os.freemem` 近似 |
+| 会话用量 | 本会话累计 token：`in`（青色）= 输入（含缓存读取），`out`（品红）= 输出，口径与 `/usage` 的 Session usage 一致 |
 | 套餐用量 | `周` 与 `5h` 两条限额的已用百分比与重置倒计时，配色同进度条阈值（绿 <60%、黄 <85%、红 ≥85%）；数据来自托管版 `/usages` 接口 |
 | 版本号 | kimi-code 版本，如 `Kimi v0.30.0` |
 
