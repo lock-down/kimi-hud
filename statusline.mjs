@@ -12,7 +12,7 @@
 import os from 'node:os';
 import path from 'node:path';
 import { execSync, spawn } from 'node:child_process';
-import { closeSync, existsSync, openSync, readFileSync, readdirSync, readSync, statSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, openSync, readFileSync, readdirSync, readSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
 const ESC = '\x1b[';
@@ -30,7 +30,33 @@ const boldRed = (s) => paint('1;31', s);
 
 const KIMI_HOME = process.env.KIMI_CODE_HOME || path.join(os.homedir(), '.kimi-code');
 const USAGE_CACHE = path.join(KIMI_HOME, 'statusline-usage-cache.json');
+const SESSION_USAGE_CACHE = path.join(KIMI_HOME, 'statusline-session-usage-cache.json');
+const REFRESH_LOCK = path.join(KIMI_HOME, 'statusline-usage-refresh.lock');
 const USAGE_STALE_MS = 120 * 1000;
+const REFRESH_LOCK_TTL_MS = 15 * 1000;
+
+// Strip C0 control chars and DEL from external strings (payload fields, wire
+// values) so they cannot inject ANSI escapes or extra lines into the footer.
+const clean = (s) => String(s ?? '').replace(/[\x00-\x1f\x7f]/g, '');
+
+function readJsonFile(file) {
+  try {
+    return JSON.parse(readFileSync(file, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+// Write tmp + rename so 1Hz readers never observe a torn cache file.
+function writeJsonAtomic(file, obj) {
+  const tmp = `${file}.${process.pid}.tmp`;
+  try {
+    writeFileSync(tmp, JSON.stringify(obj), { mode: 0o600 });
+    renameSync(tmp, file);
+  } catch {
+    try { unlinkSync(tmp); } catch { /* ignore */ }
+  }
+}
 
 function fmtTokens(n) {
   if (typeof n !== 'number' || !Number.isFinite(n) || n <= 0) return '0';
@@ -39,17 +65,24 @@ function fmtTokens(n) {
     return (Number.isInteger(v) ? String(v) : v.toFixed(1)) + 'M';
   }
   if (n >= 1024) {
-    const v = n / 1024;
-    return (n < 102400 ? v.toFixed(1) : String(Math.round(v))) + 'k';
+    const k = n / 1024;
+    if (k >= 100) {
+      const r = Math.round(k);
+      return r >= 1024 ? '1M' : `${r}k`;
+    }
+    const f = k.toFixed(1);
+    return f === '100.0' ? '100k' : `${f}k`;
   }
   return String(Math.round(n));
 }
 
 // Countdown like kimi's /usage: two largest units, e.g. "1d 19h" / "2h 10m".
+// Returns '' when the reset time has already passed.
 function fmtCountdown(resetTime) {
   const ms = Date.parse(resetTime || '');
   if (!Number.isFinite(ms)) return '';
-  let s = Math.max(0, Math.floor((ms - Date.now()) / 1000));
+  let s = Math.floor((ms - Date.now()) / 1000);
+  if (s <= 0) return '';
   const d = Math.floor(s / 86400);
   s -= d * 86400;
   const h = Math.floor(s / 3600);
@@ -72,7 +105,7 @@ function memorySegment() {
     const total = os.totalmem();
     let avail;
     if (process.platform === 'darwin') {
-      const out = execSync('vm_stat', { encoding: 'utf8', timeout: 100 });
+      const out = execSync('vm_stat', { encoding: 'utf8', timeout: 60 });
       const pageSize = Number(out.match(/page size of (\d+) bytes/)?.[1]) || 16384;
       const pages = (name) => Number(out.match(new RegExp(`${name}:\\s+(\\d+)\\.`))?.[1]) || 0;
       avail = (pages('Pages free') + pages('Pages inactive') + pages('Pages speculative')) * pageSize;
@@ -95,7 +128,8 @@ function gitStatsSegment(cwd) {
     const out = execSync('git --no-optional-locks status --porcelain=v1', {
       cwd: cwd || process.cwd(),
       encoding: 'utf8',
-      timeout: 200,
+      timeout: 150,
+      maxBuffer: 8 * 1024 * 1024,
       stdio: ['ignore', 'pipe', 'ignore'],
     });
     let added = 0;
@@ -105,6 +139,8 @@ function gitStatsSegment(cwd) {
       const x = line[0];
       const y = line[1];
       if (x === '?' && y === '?') { added++; continue; }
+      // Unmerged (conflict) entries: UU, AU, UA, DU, UD — count as modified.
+      if (x === 'U' || y === 'U') { modified++; continue; }
       if (x === 'A' || y === 'A') added++;
       else if ('MRTD'.includes(x) || 'MRTD'.includes(y)) modified++;
     }
@@ -132,7 +168,11 @@ function findSessionDir(sessionId) {
   if (!sessionId) return null;
   try {
     const sessionsRoot = path.join(KIMI_HOME, 'sessions');
+    // The payload's sessionId already carries the "session_" prefix. Validate
+    // before joining paths: the value arrives over stdin and must not be able
+    // to escape the sessions root ("..", separators, control chars).
     const dirName = sessionId.startsWith('session_') ? sessionId : `session_${sessionId}`;
+    if (!/^session_[A-Za-z0-9_-]+$/.test(dirName)) return null;
     for (const dir of readdirSync(sessionsRoot)) {
       const candidate = path.join(sessionsRoot, dir, dirName);
       if (existsSync(candidate)) return candidate;
@@ -175,23 +215,74 @@ function currentEffort(sessionDir) {
 // Sum the session's usage.record events across every agent wire file.
 // input = inputOther + inputCacheRead + inputCacheCreation — the same
 // formula kimi's /usage uses for "Session usage".
+// Wire files grow unbounded, so a sidecar cache remembers each wire's byte
+// offset and running totals; every tick only reads the appended tail.
 function sessionUsageSegment(sessionDir) {
   try {
     const agentsDir = path.join(sessionDir, 'agents');
+    const cache = readJsonFile(SESSION_USAGE_CACHE) || {};
+    const entry = cache[sessionDir] && typeof cache[sessionDir] === 'object' ? cache[sessionDir] : { wires: {}, touched: 0 };
+    entry.touched = Date.now();
+    entry.wires = entry.wires && typeof entry.wires === 'object' ? entry.wires : {};
     let input = 0;
     let output = 0;
+    let dirty = false;
     for (const agent of readdirSync(agentsDir)) {
       const wire = path.join(agentsDir, agent, 'wire.jsonl');
-      if (!existsSync(wire)) continue;
-      const text = readFileSync(wire, 'utf8');
-      for (const line of text.split('\n')) {
-        if (!line.startsWith('{"type":"usage.record"')) continue;
-        try {
-          const u = JSON.parse(line).usage || {};
-          input += (u.inputOther || 0) + (u.inputCacheRead || 0) + (u.inputCacheCreation || 0);
-          output += u.output || 0;
-        } catch { /* skip malformed line */ }
+      let size;
+      try {
+        size = statSync(wire).size;
+      } catch {
+        continue;
       }
+      const w = entry.wires[wire] && typeof entry.wires[wire] === 'object'
+        ? entry.wires[wire]
+        : { offset: 0, input: 0, output: 0 };
+      // Reset on truncation/rotation or corrupt cache values.
+      if (!Number.isFinite(w.offset) || !Number.isFinite(w.input) || !Number.isFinite(w.output) || size < w.offset) {
+        w.offset = 0;
+        w.input = 0;
+        w.output = 0;
+      }
+      if (size > w.offset) {
+        const fd = openSync(wire, 'r');
+        let chunk;
+        try {
+          const buf = Buffer.alloc(size - w.offset);
+          readSync(fd, buf, 0, buf.length, w.offset);
+          chunk = buf.toString('utf8');
+        } finally {
+          closeSync(fd);
+        }
+        // Consume whole lines only; a partially-written tail is retried next tick.
+        const lastNl = chunk.lastIndexOf('\n');
+        if (lastNl !== -1) {
+          const complete = chunk.slice(0, lastNl + 1);
+          for (const line of complete.split('\n')) {
+            if (!line.includes('"type":"usage.record"')) continue;
+            try {
+              const u = JSON.parse(line).usage || {};
+              w.input += (Number(u.inputOther) || 0) + (Number(u.inputCacheRead) || 0) + (Number(u.inputCacheCreation) || 0);
+              w.output += Number(u.output) || 0;
+            } catch { /* skip malformed line */ }
+          }
+          w.offset += Buffer.byteLength(complete, 'utf8');
+          dirty = true;
+        }
+      }
+      entry.wires[wire] = w;
+      input += w.input;
+      output += w.output;
+    }
+    if (dirty) {
+      cache[sessionDir] = entry;
+      // Bound the sidecar: keep at most 20 most-recently-touched sessions.
+      const keys = Object.keys(cache);
+      if (keys.length > 20) {
+        keys.sort((a, b) => (cache[a]?.touched || 0) - (cache[b]?.touched || 0));
+        for (const k of keys.slice(0, keys.length - 20)) delete cache[k];
+      }
+      writeJsonAtomic(SESSION_USAGE_CACHE, cache);
     }
     if (input === 0 && output === 0) return null;
     return `${dim('会话')} in ${cyan(fmtTokens(input))} out ${magenta(fmtTokens(output))}`;
@@ -203,18 +294,21 @@ function sessionUsageSegment(sessionDir) {
 // Plan usage (weekly / 5h limits) rendered from the cache file; when the
 // cache is stale or missing, kick off a detached refresh for the next tick.
 function planUsageSegment() {
-  let cache = null;
-  try {
-    cache = JSON.parse(readFileSync(USAGE_CACHE, 'utf8'));
-  } catch { /* no cache yet */ }
-  if (cache === null || Date.now() - (cache.fetchedAt || 0) > USAGE_STALE_MS) {
+  const cache = readJsonFile(USAGE_CACHE);
+  const fetchedAt = cache ? Number(cache.fetchedAt) : NaN;
+  const age = Date.now() - fetchedAt;
+  // Non-finite or out-of-window fetchedAt (corrupt file, clock skew) counts as stale.
+  if (cache === null || !Number.isFinite(fetchedAt) || age < 0 || age > USAGE_STALE_MS) {
     triggerUsageRefresh();
   }
   if (cache === null) return null;
   const parts = [];
   for (const [label, row] of [['周', cache.weekly], ['5h', cache.fiveHour]]) {
-    if (!row || !row.limit) continue;
-    const pct = Math.round((row.used / row.limit) * 100);
+    if (!row || typeof row !== 'object') continue;
+    const used = Number(row.used);
+    const limit = Number(row.limit);
+    if (!Number.isFinite(used) || !Number.isFinite(limit) || limit <= 0) continue;
+    const pct = Math.round((used / limit) * 100);
     const countdown = fmtCountdown(row.resetTime);
     parts.push(`${dim(label)} ${pctColor(pct)(`${pct}%`)}${countdown ? dim(` (${countdown})`) : ''}`);
   }
@@ -226,27 +320,49 @@ function triggerUsageRefresh() {
   if (usageRefreshSpawned) return;
   usageRefreshSpawned = true;
   try {
+    // Cross-process gate: each tick is a new process, so an in-process flag
+    // alone cannot stop a spawn-per-second storm when refreshes keep failing.
+    // The lock file (mtime TTL) suppresses concurrent/rapid refreshes.
+    let locked = false;
+    try {
+      writeFileSync(REFRESH_LOCK, String(Date.now()), { flag: 'wx', mode: 0o600 });
+      locked = true;
+    } catch {
+      try {
+        const st = statSync(REFRESH_LOCK);
+        if (Date.now() - st.mtimeMs < REFRESH_LOCK_TTL_MS) return; // a refresh is in flight
+        writeFileSync(REFRESH_LOCK, String(Date.now()), { mode: 0o600 }); // steal stale lock
+        locked = true;
+      } catch { /* fall through */ }
+    }
+    if (!locked) return;
     const child = spawn(process.execPath, [fileURLToPath(import.meta.url), '--refresh-usage'], {
       detached: true,
       stdio: 'ignore',
     });
+    // spawn reports async failures (EMFILE/EAGAIN) via the error event;
+    // without a listener it would crash the render with uncaughtException.
+    child.on('error', () => { /* never let a spawn failure fail the line */ });
     child.unref();
   } catch { /* ignore */ }
 }
 
 // Refresh mode: fetch the managed /usages endpoint with the OAuth token kimi
 // stores on disk, keep only what the status line needs, and write the cache.
+// On any failure write a negative cache (old data + fresh fetchedAt) so the
+// next refresh is gated by USAGE_STALE_MS instead of retried every tick.
 async function refreshUsageCache() {
+  const prev = readJsonFile(USAGE_CACHE);
   try {
     const credPath = path.join(KIMI_HOME, 'credentials', 'kimi-code.json');
     const cred = JSON.parse(readFileSync(credPath, 'utf8'));
-    if (!cred.access_token) return;
+    if (!cred.access_token) throw new Error('no access token');
     const base = (process.env.KIMI_CODE_BASE_URL || 'https://api.kimi.com/coding/v1').replace(/\/+$/, '');
     const res = await fetch(`${base}/usages`, {
       headers: { Authorization: `Bearer ${cred.access_token}`, Accept: 'application/json' },
       signal: AbortSignal.timeout(8000),
     });
-    if (!res.ok) return;
+    if (!res.ok) throw new Error(`http ${res.status}`);
     const data = await res.json();
     const pick = (row) => ({
       used: Number(row.used) || 0,
@@ -264,8 +380,10 @@ async function refreshUsageCache() {
         if (isFiveHour && entry.detail) out.fiveHour = pick(entry.detail);
       }
     }
-    writeFileSync(USAGE_CACHE, JSON.stringify(out), { mode: 0o600 });
-  } catch { /* keep the previous cache */ }
+    writeJsonAtomic(USAGE_CACHE, out);
+  } catch {
+    writeJsonAtomic(USAGE_CACHE, { ...(prev && typeof prev === 'object' ? prev : {}), fetchedAt: Date.now() });
+  }
 }
 
 function readStdin() {
@@ -284,11 +402,12 @@ function main() {
   return readStdin().then((raw) => {
     const p = JSON.parse(raw);
     const segs = [];
-    const sessionDir = findSessionDir(p.sessionId);
+    const sessionDir = findSessionDir(clean(p.sessionId));
 
     // 1. cwd + git branch + working-tree stats: ~ ⎇ main +2 ~1
-    const cwdSeg = shortCwd(p.cwd);
-    const gitSeg = p.gitBranch ? magenta(` ⎇ ${p.gitBranch}`) + gitStatsSegment(p.cwd) : '';
+    const cwdSeg = shortCwd(clean(p.cwd));
+    const gitBranch = clean(p.gitBranch);
+    const gitSeg = gitBranch ? magenta(` ⎇ ${gitBranch}`) + gitStatsSegment(p.cwd) : '';
     if (cwdSeg || gitSeg) segs.push(dim(cwdSeg) + gitSeg);
 
     // 2. permission / plan mode
@@ -298,11 +417,11 @@ function main() {
     else segs.push(dim('manual'));
 
     // 3. model badge with thinking effort: [K3 ● max]
-    const model = p.model || 'kimi';
-    const effort = sessionDir ? currentEffort(sessionDir) : null;
+    const model = clean(p.model) || 'kimi';
+    const effort = sessionDir ? clean(currentEffort(sessionDir)) : '';
     segs.push(cyan(`[${model}${effort ? ` ● ${effort}` : ''}]`));
 
-    // 4. system memory bar: 内存 ███░░░░░░░ 49% (31G/64G)
+    // 4. system memory: 内存 47% (30G/64G)
     const mem = memorySegment();
     if (mem) segs.push(mem);
 
@@ -317,14 +436,18 @@ function main() {
     if (pu) segs.push(pu);
 
     // 7. kimi-code version
-    if (p.version) segs.push(dim(`Kimi v${p.version}`));
+    const version = clean(p.version);
+    if (version) segs.push(dim(`Kimi v${version}`));
 
     process.stdout.write(segs.join(dim(' | ')) + '\n');
   });
 }
 
 if (process.argv[2] === '--refresh-usage') {
-  refreshUsageCache().finally(() => process.exit(0));
+  refreshUsageCache().finally(() => {
+    try { unlinkSync(REFRESH_LOCK); } catch { /* lock may belong to another run */ }
+    process.exit(0);
+  });
 } else {
   main().catch(() => process.exit(1));
 }
