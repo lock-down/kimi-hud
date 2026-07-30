@@ -355,8 +355,9 @@ function triggerUsageRefresh() {
 
 // Refresh mode: fetch the managed /usages endpoint with the OAuth token kimi
 // stores on disk, keep only what the status line needs, and write the cache.
-// On any failure write a negative cache (old data + fresh fetchedAt) so the
-// next refresh is gated by USAGE_STALE_MS instead of retried every tick.
+// On any failure write a negative cache that keeps the old data AND its
+// original fetchedAt (so the displayed data's age stays honest) and only
+// pushes retryAfter out by USAGE_STALE_MS, instead of retrying every tick.
 async function refreshUsageCache() {
   const rawPrev = readJsonFile(USAGE_CACHE);
   const prev = rawPrev && typeof rawPrev === 'object' && !Array.isArray(rawPrev) ? rawPrev : null;
