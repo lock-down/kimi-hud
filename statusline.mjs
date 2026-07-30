@@ -33,11 +33,12 @@ const USAGE_CACHE = path.join(KIMI_HOME, 'statusline-usage-cache.json');
 const SESSION_USAGE_CACHE = path.join(KIMI_HOME, 'statusline-session-usage-cache.json');
 const REFRESH_LOCK = path.join(KIMI_HOME, 'statusline-usage-refresh.lock');
 const USAGE_STALE_MS = 120 * 1000;
+const USAGE_MAX_AGE_MS = 24 * 3600 * 1000;
 const REFRESH_LOCK_TTL_MS = 15 * 1000;
 
-// Strip C0 control chars and DEL from external strings (payload fields, wire
-// values) so they cannot inject ANSI escapes or extra lines into the footer.
-const clean = (s) => String(s ?? '').replace(/[\x00-\x1f\x7f]/g, '');
+// Strip C0/C1 control chars and DEL from external strings (payload fields,
+// wire values) so they cannot inject ANSI escapes or extra lines.
+const clean = (s) => String(s ?? '').replace(/[\x00-\x1f\x7f\x80-\x9f]/g, '');
 
 function readJsonFile(file) {
   try {
@@ -139,8 +140,8 @@ function gitStatsSegment(cwd) {
       const x = line[0];
       const y = line[1];
       if (x === '?' && y === '?') { added++; continue; }
-      // Unmerged (conflict) entries: UU, AU, UA, DU, UD — count as modified.
-      if (x === 'U' || y === 'U') { modified++; continue; }
+      // Unmerged (conflict) entries: UU, AU, UA, DU, UD, AA — count as modified.
+      if (x === 'U' || y === 'U' || (x === 'A' && y === 'A')) { modified++; continue; }
       if (x === 'A' || y === 'A') added++;
       else if ('MRTD'.includes(x) || 'MRTD'.includes(y)) modified++;
     }
@@ -220,7 +221,8 @@ function currentEffort(sessionDir) {
 function sessionUsageSegment(sessionDir) {
   try {
     const agentsDir = path.join(sessionDir, 'agents');
-    const cache = readJsonFile(SESSION_USAGE_CACHE) || {};
+    const raw = readJsonFile(SESSION_USAGE_CACHE);
+    const cache = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
     const entry = cache[sessionDir] && typeof cache[sessionDir] === 'object' ? cache[sessionDir] : { wires: {}, touched: 0 };
     entry.touched = Date.now();
     entry.wires = entry.wires && typeof entry.wires === 'object' ? entry.wires : {};
@@ -298,10 +300,14 @@ function planUsageSegment() {
   const fetchedAt = cache ? Number(cache.fetchedAt) : NaN;
   const age = Date.now() - fetchedAt;
   // Non-finite or out-of-window fetchedAt (corrupt file, clock skew) counts as stale.
-  if (cache === null || !Number.isFinite(fetchedAt) || age < 0 || age > USAGE_STALE_MS) {
-    triggerUsageRefresh();
-  }
+  const stale = cache === null || !Number.isFinite(fetchedAt) || age < 0 || age > USAGE_STALE_MS;
+  // Failed refreshes back off via retryAfter instead of touching fetchedAt,
+  // so the displayed data's age stays honest.
+  const retryAfter = cache ? Number(cache.retryAfter) || 0 : 0;
+  if (stale && Date.now() >= retryAfter) triggerUsageRefresh();
   if (cache === null) return null;
+  // Data older than the max age is no longer shown at all.
+  if (Number.isFinite(age) && age >= 0 && age > USAGE_MAX_AGE_MS) return null;
   const parts = [];
   for (const [label, row] of [['周', cache.weekly], ['5h', cache.fiveHour]]) {
     if (!row || typeof row !== 'object') continue;
@@ -352,7 +358,8 @@ function triggerUsageRefresh() {
 // On any failure write a negative cache (old data + fresh fetchedAt) so the
 // next refresh is gated by USAGE_STALE_MS instead of retried every tick.
 async function refreshUsageCache() {
-  const prev = readJsonFile(USAGE_CACHE);
+  const rawPrev = readJsonFile(USAGE_CACHE);
+  const prev = rawPrev && typeof rawPrev === 'object' && !Array.isArray(rawPrev) ? rawPrev : null;
   try {
     const credPath = path.join(KIMI_HOME, 'credentials', 'kimi-code.json');
     const cred = JSON.parse(readFileSync(credPath, 'utf8'));
@@ -382,7 +389,9 @@ async function refreshUsageCache() {
     }
     writeJsonAtomic(USAGE_CACHE, out);
   } catch {
-    writeJsonAtomic(USAGE_CACHE, { ...(prev && typeof prev === 'object' ? prev : {}), fetchedAt: Date.now() });
+    // Negative cache: keep the old data and its original fetchedAt (the
+    // data's age must stay honest), only push the next retry out.
+    writeJsonAtomic(USAGE_CACHE, { ...(prev || {}), retryAfter: Date.now() + USAGE_STALE_MS });
   }
 }
 
