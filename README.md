@@ -46,7 +46,7 @@ chmod +x kimi-hud/statusline.mjs
 #Mac
 command = "/path/to/kimi-hud/statusline.mjs"
 #Windows
-command = 'node PATH\.kimi-code\statusline.mjs'
+command = 'node path\.kimi-code\statusline.mjs'
 # 可选：脚本失败时回退到这个内置槽位布局
 items = [ "mode", "goal", "model", "tasks", "cwd", "git", "tips" ]
 ```
